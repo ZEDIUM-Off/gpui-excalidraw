@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::{base::StyledExt, prelude::FluentBuilder as _, *};
 
 use crate::{
@@ -53,7 +54,35 @@ fn laser_trail_at(points: &[LaserPoint], now: std::time::Instant) -> Vec<(Point,
 
 pub(crate) type Handler<E> = Box<dyn Fn(&E, &mut Window, &mut App)>;
 
+/// Values are engine/world coordinates, including linear points. Hosts must
+/// convert at their document-format boundary, not serialize the typed scene.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbeddedEvent {
+    Begin {
+        originals: Vec<Element>,
+    },
+    Commit {
+        originals: Vec<Element>,
+        changes: Vec<Element>,
+    },
+    Cancel {
+        originals: Vec<Element>,
+    },
+}
+
+#[derive(Default)]
+struct EmbeddedState {
+    originals: Option<Vec<Element>>,
+    move_origin: Option<Point>,
+    events: Vec<EmbeddedEvent>,
+    bounds: Option<gpui_kit::Bounds<Pixels>>,
+    focus_subscription: Option<Subscription>,
+}
+
+impl EventEmitter<EmbeddedEvent> for Editor {}
+
 pub struct Editor {
+    embedded: Option<EmbeddedState>,
     pub document: Document,
     pub history: History,
     pub i18n: I18n,
@@ -212,8 +241,477 @@ pub struct Editor {
 }
 
 impl Editor {
+    fn embedded_local_point(&self, position: gpui_kit::Point<Pixels>) -> (f32, f32) {
+        let origin = self
+            .embedded
+            .as_ref()
+            .and_then(|state| state.bounds)
+            .map(|bounds| bounds.origin)
+            .unwrap_or_default();
+        (
+            (position.x - origin.x).to_f64() as f32,
+            (position.y - origin.y).to_f64() as f32,
+        )
+    }
+
+    fn render_embedded(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.sync_image_sources();
+        let tokens = Tokens::for_palette(palette_of(self.document.theme));
+        let focus = self
+            .focus_handle
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        if self
+            .embedded
+            .as_ref()
+            .is_some_and(|state| state.focus_subscription.is_none())
+        {
+            let subscription = cx.on_blur(&focus, window, |this, _, cx| {
+                this.cancel_embedded_gesture();
+                this.space_pan = false;
+                for event in this.take_embedded_events() {
+                    cx.emit(event);
+                }
+                cx.notify();
+            });
+            if let Some(state) = &mut self.embedded {
+                state.focus_subscription = Some(subscription);
+            }
+        }
+        let scene = self.document.scene.clone();
+        let images = self.image_sources.clone();
+        let zoom = self.document.zoom;
+        let scroll = self.document.scroll;
+        let selected = selection_bounds(&scene, &self.document.selected);
+        let entity = cx.entity();
+        let mut toolbar = chrome::toolbar_island(tokens).occlude();
+        for (tool, icon) in [
+            (Tool::Selection, "SelectionIcon"),
+            (Tool::Hand, "handIcon"),
+            (Tool::Text, "TextIcon"),
+        ] {
+            toolbar = toolbar.child(
+                chrome::tool_button(
+                    format!("embedded-{icon}"),
+                    icon,
+                    None,
+                    self.document.tool == tool,
+                    tokens,
+                )
+                .on_click(Self::act(cx, move |this, _, window, cx| {
+                    if let Some(focus) = &this.focus_handle {
+                        focus.focus(window, cx);
+                    }
+                    this.set_tool(tool);
+                })),
+            );
+        }
+        div()
+            .id("excalidraw-embedded")
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(crate::properties::parse_hex(
+                &self.document.view_background_color,
+            ))
+            .track_focus(&focus)
+            .on_prepaint(move |bounds, _, cx| {
+                entity.update(cx, |this, _| {
+                    this.viewport = (bounds.size.width.to_f64(), bounds.size.height.to_f64());
+                    if let Some(state) = &mut this.embedded {
+                        state.bounds = Some(bounds);
+                    }
+                });
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                Self::act(cx, |this, event: &MouseDownEvent, window, cx| {
+                    if let Some(focus) = &this.focus_handle {
+                        focus.focus(window, cx);
+                    }
+                    let (x, y) = this.embedded_local_point(event.position);
+                    this.on_canvas_mouse_down(x, y, event.modifiers, event.click_count);
+                }),
+            )
+            .on_mouse_move(Self::act(cx, |this, event: &MouseMoveEvent, _, _| {
+                let (x, y) = this.embedded_local_point(event.position);
+                this.on_canvas_mouse_move(x, y, event.modifiers);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                Self::act(cx, |this, event: &MouseUpEvent, _, _| {
+                    let (x, y) = this.embedded_local_point(event.position);
+                    this.on_canvas_mouse_up(x, y, event.modifiers);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                Self::act(cx, |this, event: &MouseUpEvent, _, _| {
+                    if this.is_interacting() {
+                        let (x, y) = this.embedded_local_point(event.position);
+                        this.on_canvas_mouse_up(x, y, event.modifiers);
+                    }
+                }),
+            )
+            .on_key_down(Self::act(cx, |this, event: &KeyDownEvent, _, cx| {
+                if this.handle_key(
+                    &event.keystroke.key,
+                    event.keystroke.key_char.clone(),
+                    event.keystroke.modifiers,
+                    this.viewport,
+                ) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_key_up(Self::act(cx, |this, event: &KeyUpEvent, _, _| {
+                if event.keystroke.key == "space" {
+                    this.space_pan = false;
+                    this.panning = false;
+                }
+            }))
+            .on_scroll(Self::act(cx, |this, event: &ScrollEvent, _, _| {
+                let (delta_x, delta_y) = match event.delta {
+                    ScrollDelta::Pixels(delta) => (delta.x.to_f64(), delta.y.to_f64()),
+                    ScrollDelta::Lines(delta) => (delta.x as f64 * 20.0, delta.y as f64 * 20.0),
+                };
+                if event.modifiers.control || event.modifiers.platform {
+                    let (x, y) = this.embedded_local_point(event.position);
+                    let old_zoom = this.document.zoom;
+                    this.document.zoom = (old_zoom * (-delta_y * 0.01).exp()).clamp(0.05, 8.0);
+                    let factor = this.document.zoom / old_zoom;
+                    this.document.scroll = Point::new(
+                        x as f64 - (x as f64 - this.document.scroll.x) * factor,
+                        y as f64 - (y as f64 - this.document.scroll.y) * factor,
+                    );
+                } else {
+                    this.document.scroll.x -= delta_x;
+                    this.document.scroll.y -= delta_y;
+                }
+            }))
+            .child(
+                canvas(
+                    move |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let scroll_x = scroll.x + bounds.origin.x.to_f64();
+                        let scroll_y = scroll.y + bounds.origin.y.to_f64();
+                        crate::canvas::paint_scene(
+                            &scene, zoom, scroll_x, scroll_y, &images, window, cx,
+                        );
+                        if let Some(bounds) = &selected {
+                            crate::canvas::paint_selection_overlay(
+                                bounds,
+                                tokens.accent(),
+                                zoom,
+                                scroll_x,
+                                scroll_y,
+                                window,
+                            );
+                        }
+                    },
+                )
+                .size_full(),
+            )
+            .child(div().absolute().top(px(8.0)).left(px(8.0)).child(toolbar))
+            .into_any_element()
+    }
+
+    pub fn new_embedded(scene: Scene, app_state: AppState) -> Self {
+        let mut editor = Self::new();
+        editor.replace_scene(scene, app_state);
+        editor.history = History::new(100);
+        editor.document.tool = Tool::Selection;
+        editor.embedded = Some(EmbeddedState::default());
+        editor
+    }
+
+    pub fn is_embedded(&self) -> bool {
+        self.embedded.is_some()
+    }
+
+    /// Direct input callers drain events here. UI listeners emit them through
+    /// GPUI's EventEmitter instead, before notifying the host.
+    pub fn take_embedded_events(&mut self) -> Vec<EmbeddedEvent> {
+        self.embedded
+            .as_mut()
+            .map(|state| std::mem::take(&mut state.events))
+            .unwrap_or_default()
+    }
+
+    /// Applies existing-element replacements atomically, without history or
+    /// events. An overlapping live gesture must be cancelled/reconciled first.
+    pub fn apply_embedded_delta(&mut self, changes: &[Element]) -> Result<(), String> {
+        let state = self.embedded.as_ref().ok_or("not an embedded editor")?;
+        let mut ids = std::collections::HashSet::new();
+        for change in changes {
+            if !ids.insert(change.id()) || self.document.scene.get(change.id()).is_none() {
+                return Err("delta must contain unique existing IDs".into());
+            }
+            if state.originals.as_ref().is_some_and(|originals| {
+                originals.iter().any(|original| {
+                    original.id() == change.id()
+                        || Self::embedded_dependencies(change).contains(&original.id())
+                })
+            }) {
+                return Err("delta overlaps the active gesture".into());
+            }
+        }
+        for change in changes {
+            if let Some(element) = self.document.scene.get_mut(change.id()) {
+                *element = change.clone();
+            }
+        }
+        self.sync_image_sources();
+        Ok(())
+    }
+
+    fn embedded_dependencies(element: &Element) -> Vec<&str> {
+        let mut ids = Vec::new();
+        if let Some(bound) = &element.base().bound_elements {
+            ids.extend(bound.iter().map(|binding| binding.id.as_str()));
+        }
+        match element {
+            Element::Text(text) => ids.extend(text.container_id.as_deref()),
+            Element::Arrow(arrow) => {
+                ids.extend(
+                    arrow
+                        .linear
+                        .start_binding
+                        .as_ref()
+                        .map(|binding| binding.element_id.as_str()),
+                );
+                ids.extend(
+                    arrow
+                        .linear
+                        .end_binding
+                        .as_ref()
+                        .map(|binding| binding.element_id.as_str()),
+                );
+            }
+            Element::Line(line) => {
+                ids.extend(
+                    line.linear
+                        .start_binding
+                        .as_ref()
+                        .map(|binding| binding.element_id.as_str()),
+                );
+                ids.extend(
+                    line.linear
+                        .end_binding
+                        .as_ref()
+                        .map(|binding| binding.element_id.as_str()),
+                );
+            }
+            _ => {}
+        }
+        ids
+    }
+
+    fn begin_embedded_gesture(&mut self, ids: Vec<String>) {
+        let mut touched: std::collections::HashSet<String> = ids.into_iter().collect();
+        loop {
+            let before = touched.len();
+            for element in self.document.scene.non_deleted() {
+                let dependencies = Self::embedded_dependencies(element);
+                if touched.contains(element.id())
+                    || dependencies.iter().any(|id| touched.contains(*id))
+                {
+                    touched.insert(element.id().to_string());
+                    touched.extend(dependencies.into_iter().map(str::to_string));
+                }
+            }
+            if touched.len() == before {
+                break;
+            }
+        }
+        let originals: Vec<Element> = self
+            .document
+            .scene
+            .non_deleted()
+            .filter(|element| touched.contains(element.id()))
+            .cloned()
+            .collect();
+        if let Some(state) = &mut self.embedded {
+            state.events.push(EmbeddedEvent::Begin {
+                originals: originals.clone(),
+            });
+            state.originals = Some(originals);
+        }
+    }
+
+    fn commit_embedded_gesture(&mut self) {
+        if let Some(state) = &mut self.embedded {
+            state.move_origin = None;
+            if let Some(originals) = state.originals.take() {
+                let changes = originals
+                    .iter()
+                    .filter_map(|original| {
+                        self.document
+                            .scene
+                            .get(original.id())
+                            .filter(|current| *current != original)
+                            .cloned()
+                    })
+                    .collect();
+                state
+                    .events
+                    .push(EmbeddedEvent::Commit { originals, changes });
+            }
+        }
+        self.editing_text = None;
+    }
+
+    pub fn cancel_embedded_gesture(&mut self) {
+        if let Some(state) = &mut self.embedded {
+            state.move_origin = None;
+            if let Some(originals) = state.originals.take() {
+                for original in &originals {
+                    if let Some(element) = self.document.scene.get_mut(original.id()) {
+                        *element = original.clone();
+                    }
+                }
+                state.events.push(EmbeddedEvent::Cancel { originals });
+            }
+        }
+        self.editing_text = None;
+        self.panning = false;
+    }
+
+    fn embedded_mouse_down(&mut self, x: f32, y: f32, modifiers: Modifiers, click_count: usize) {
+        self.commit_embedded_gesture();
+        let world = self.screen_point(x, y);
+        if self.document.tool == Tool::Hand || self.space_pan || self.document.view_mode {
+            self.panning = true;
+            self.pan_start = Some(Point::new(x as f64, y as f64));
+            self.pan_scroll = Some(self.document.scroll);
+            return;
+        }
+        let hit = if self.document.tool == Tool::Text || click_count >= 2 {
+            self.document
+                .text_target_at(world, 5.0 / self.document.zoom)
+        } else {
+            self.document.element_at(world, 5.0 / self.document.zoom)
+        };
+        let Some(id) = hit else {
+            if !modifiers.shift {
+                self.document.clear_selection();
+            }
+            return;
+        };
+        if modifiers.shift && self.document.selected.contains(&id) {
+            self.document.selected.remove(&id);
+            return;
+        }
+        if !self.document.selected.contains(&id) {
+            if modifiers.shift {
+                self.document.selected.insert(id.clone());
+            } else {
+                self.document.select(&id);
+            }
+        }
+        if self.document.tool == Tool::Text || click_count >= 2 {
+            let text_id = match self.document.scene.get(&id) {
+                Some(Element::Text(_)) => Some(id),
+                _ => self.document.container_text_id(&id),
+            };
+            if let Some(text_id) = text_id {
+                self.begin_embedded_gesture(vec![text_id.clone()]);
+                self.editing_text = Some(text_id);
+            }
+            return;
+        }
+        self.begin_embedded_gesture(self.document.selected.iter().cloned().collect());
+        if let Some(state) = &mut self.embedded {
+            state.move_origin = Some(world);
+        }
+    }
+
+    fn refresh_embedded_bindings(&mut self) {
+        let Some(originals) = self
+            .embedded
+            .as_ref()
+            .and_then(|state| state.originals.as_ref())
+        else {
+            return;
+        };
+        // Derived refresh normalizes every binding in a scene. Restrict its
+        // writes to the captured closure so a gesture cannot rewrite a remote edit.
+        let mut derived = self.document.scene.clone();
+        crate::core::binding::refresh_derived(&mut derived);
+        for original in originals {
+            if let (Some(current), Some(updated)) = (
+                self.document.scene.get_mut(original.id()),
+                derived.get(original.id()),
+            ) {
+                *current = updated.clone();
+            }
+        }
+    }
+
+    fn embedded_mouse_move(&mut self, x: f32, y: f32) {
+        if self.panning {
+            if let (Some(start), Some(scroll)) = (self.pan_start, self.pan_scroll) {
+                self.document.scroll =
+                    Point::new(scroll.x + x as f64 - start.x, scroll.y + y as f64 - start.y);
+            }
+            return;
+        }
+        let world = self.screen_point(x, y);
+        let Some(state) = &self.embedded else {
+            return;
+        };
+        let (Some(origin), Some(originals)) = (state.move_origin, &state.originals) else {
+            return;
+        };
+        for original in originals {
+            if self.document.selected.contains(original.id()) && !original.base().locked {
+                let mut moved = original.clone();
+                crate::core::transform::translate_element(
+                    &mut moved,
+                    world.x - origin.x,
+                    world.y - origin.y,
+                );
+                if let Some(element) = self.document.scene.get_mut(original.id()) {
+                    *element = moved;
+                }
+            }
+        }
+        self.refresh_embedded_bindings();
+    }
+
+    fn embedded_key(&mut self, key: &str, key_char: Option<String>, modifiers: Modifiers) -> bool {
+        if key == "escape" {
+            self.cancel_embedded_gesture();
+            return true;
+        }
+        if modifiers.control || modifiers.platform {
+            // Save and history belong to the host. Suppressed canvas commands
+            // are consumed so they cannot reach another editing surface.
+            return !matches!(key, "s" | "z" | "y");
+        }
+        if let Some(id) = self.editing_text.clone() {
+            if matches!(key, "enter" | "numpadenter") && !modifiers.shift {
+                self.commit_embedded_gesture();
+            } else {
+                self.handle_text_key(&id, key, key_char, modifiers);
+                if let Some(Element::Text(text)) = self.document.scene.get_mut(&id) {
+                    text.original_text = text.text.clone();
+                }
+            }
+            return true;
+        }
+        match key {
+            "v" | "1" => self.set_tool(Tool::Selection),
+            "h" => self.set_tool(Tool::Hand),
+            "t" | "8" => self.set_tool(Tool::Text),
+            "space" => self.space_pan = true,
+            _ => {}
+        }
+        true
+    }
+
     pub fn new() -> Self {
         Self {
+            embedded: None,
             document: Document::new(),
             history: History::new(100),
             i18n: I18n::new(Language::detect()),
@@ -315,6 +813,13 @@ impl Editor {
     }
 
     pub fn set_tool(&mut self, tool: Tool) {
+        if self.is_embedded() {
+            if matches!(tool, Tool::Selection | Tool::Hand | Tool::Text) {
+                self.commit_embedded_gesture();
+                self.document.tool = tool;
+            }
+            return;
+        }
         self.cancel_pending();
         self.active_locked_id = None;
         self.document.tool = tool;
@@ -527,6 +1032,9 @@ impl Editor {
     {
         Box::new(cx.listener(move |this, event, window, cx| {
             f(this, event, window, cx);
+            for event in this.take_embedded_events() {
+                cx.emit(event);
+            }
             cx.notify();
         }))
     }
@@ -594,6 +1102,9 @@ impl Editor {
     }
 
     pub fn is_interacting(&self) -> bool {
+        if let Some(state) = &self.embedded {
+            return self.panning || state.move_origin.is_some();
+        }
         self.panning
             || self.drawing
             || self.erasing
@@ -802,6 +1313,10 @@ impl Editor {
             Some(crate::core::element::Element::Text(t)) if t.container_id.is_some()
         );
         if container_bound {
+            if self.is_embedded() {
+                self.refresh_embedded_bindings();
+                return;
+            }
             self.document.refresh_bindings();
             return;
         }
@@ -933,6 +1448,10 @@ impl Editor {
     }
 
     pub fn on_canvas_mouse_down(&mut self, x: f32, y: f32, mods: Modifiers, click_count: usize) {
+        if self.is_embedded() {
+            self.embedded_mouse_down(x, y, mods, click_count);
+            return;
+        }
         let world = self.screen_point(x, y);
         self.context_menu = None;
         self.show_menu = false;
@@ -1212,6 +1731,10 @@ impl Editor {
     }
 
     pub fn on_canvas_mouse_move(&mut self, x: f32, y: f32, mods: Modifiers) {
+        if self.is_embedded() {
+            self.embedded_mouse_move(x, y);
+            return;
+        }
         self.cursor_mods = mods;
         self.cursor_screen = (x as f64, y as f64);
         if self.panning {
@@ -1394,6 +1917,14 @@ impl Editor {
     }
 
     pub fn on_canvas_mouse_up(&mut self, x: f32, y: f32, mods: Modifiers) {
+        if self.is_embedded() {
+            self.embedded_mouse_move(x, y);
+            self.panning = false;
+            if self.editing_text.is_none() {
+                self.commit_embedded_gesture();
+            }
+            return;
+        }
         let world = self.screen_point(x, y);
 
         if !self.panning && !self.erasing && self.document.tool == Tool::Selection {
@@ -1579,6 +2110,9 @@ impl Editor {
     }
 
     pub fn on_undo(&mut self) {
+        if self.is_embedded() {
+            return;
+        }
         if self.history.undo(&mut self.document.scene) {
             self.document.clear_selection();
             self.document.refresh_bindings();
@@ -1586,6 +2120,9 @@ impl Editor {
     }
 
     fn on_redo(&mut self) {
+        if self.is_embedded() {
+            return;
+        }
         if self.history.redo(&mut self.document.scene) {
             self.document.clear_selection();
             self.document.refresh_bindings();
@@ -1692,6 +2229,9 @@ impl Editor {
         mime: &str,
         at: Option<Point>,
     ) -> Option<String> {
+        if self.is_embedded() {
+            return None;
+        }
         if bytes.is_empty() {
             return None;
         }
@@ -1720,6 +2260,9 @@ impl Editor {
     }
 
     pub fn paste_image_from_clipboard(&mut self, cx: &App) -> bool {
+        if self.is_embedded() {
+            return false;
+        }
         let Some(item) = cx.read_from_clipboard() else {
             return false;
         };
@@ -1733,6 +2276,9 @@ impl Editor {
     }
 
     pub fn paste_text_from_clipboard(&mut self, cx: &App) -> bool {
+        if self.is_embedded() {
+            return false;
+        }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return false;
         };
@@ -1809,6 +2355,9 @@ impl Editor {
     }
 
     pub fn insert_image_paths(&mut self, paths: &[std::path::PathBuf]) -> usize {
+        if self.is_embedded() {
+            return 0;
+        }
         let mut inserted = 0;
         for path in paths {
             if path.is_dir() {
@@ -2291,6 +2840,9 @@ impl Editor {
     }
 
     pub fn save_to(&mut self, path: &str) -> Result<(), String> {
+        if self.is_embedded() {
+            return Err("embedded save belongs to host".into());
+        }
         let json = crate::export::scene_to_json(&self.document.scene, &self.app_state())
             .map_err(|e| e.to_string())?;
         std::fs::write(path, json).map_err(|e| e.to_string())?;
@@ -2299,6 +2851,9 @@ impl Editor {
     }
 
     pub fn load_from(&mut self, path: &str) -> Result<(), String> {
+        if self.is_embedded() {
+            return Err("embedded load belongs to host".into());
+        }
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let (scene, app) = crate::export::json_to_scene(&text).map_err(|e| e.to_string())?;
         self.push_checkpoint();
@@ -2316,6 +2871,9 @@ impl Editor {
     }
 
     pub fn open_scene_picker(&mut self, cx: &mut Context<Self>) {
+        if self.is_embedded() {
+            return;
+        }
         let prompt = SharedString::from(self.i18n.t("menu.open"));
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -2358,6 +2916,9 @@ impl Editor {
     }
 
     pub fn open_save_dialog(&mut self) {
+        if self.is_embedded() {
+            return;
+        }
         if self.project_name.is_empty() {
             self.project_name = self.untitled_name();
         }
@@ -2378,6 +2939,9 @@ impl Editor {
     }
 
     pub fn save_scene_picker(&mut self, cx: &mut Context<Self>) {
+        if self.is_embedded() {
+            return;
+        }
         let name = self.project_name_value();
         let name = if name.ends_with(".excalidraw") {
             name
@@ -2502,6 +3066,9 @@ impl Editor {
     /// Drops the generated diagram into the scene, centered in the viewport and
     /// selected, then closes the dialog like upstream's `insertToEditor`.
     pub fn insert_mermaid_diagram(&mut self) -> bool {
+        if self.is_embedded() {
+            return false;
+        }
         if self.mermaid_preview.is_empty() {
             return false;
         }
@@ -2770,6 +3337,9 @@ impl Editor {
         viewport: (f64, f64),
     ) -> bool {
         self.viewport = viewport;
+        if self.is_embedded() {
+            return self.embedded_key(key, key_char, modifiers);
+        }
 
         if self.eye_dropper.is_some() && key == "escape" {
             self.cancel_eye_dropper();
@@ -4722,6 +5292,9 @@ fn plain_text(s: &str) -> AnyElement {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.is_embedded() {
+            return self.render_embedded(window, cx).into_any_element();
+        }
         let tokens = crate::design::Tokens::for_palette(palette_of(self.document.theme));
         self.viewport = (
             window.viewport_size().width.to_f64(),
@@ -5470,7 +6043,7 @@ impl Render for Editor {
             root = root.child(toast);
         }
 
-        root
+        root.into_any_element()
     }
 }
 
@@ -6755,6 +7328,9 @@ impl Editor {
     }
 
     pub fn handle_external_drop(&mut self, paths: &ExternalPaths) -> bool {
+        if self.is_embedded() {
+            return false;
+        }
         let list = paths.paths();
         let drag = self.file_drag.take();
         let kind = drag

@@ -1,3 +1,5 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
 # gpui-excalidraw
 
 A project that starts from scratch and uses Rust to re implement [Excalidraw](https://github.com/excalidraw/excalidraw), built on top of [GPUI Kit](https://gpui-kit.com), but removed certain features.

@@ -4,7 +4,7 @@ use gpui_kit::*;
 
 include!(concat!(env!("OUT_DIR"), "/icons_generated.rs"));
 
-const PREFIX: &str = "icons/";
+pub const ICON_PREFIX: &str = "excalidraw/icons/";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IconAssets;
@@ -14,7 +14,7 @@ impl IconAssets {
     /// every path this crate does not provide itself.
     ///
     /// The editor draws all of its chrome through [`icon`], which resolves to
-    /// `icons/<name>.svg`. Those SVGs ship with this crate and are *not* part
+    /// `excalidraw/icons/<name>.svg`. Those SVGs ship with this crate and are *not* part
     /// of `gpui_kit::assets::Assets`, so an application that only registers the
     /// component bundle renders the toolbar, menus and panels with blank
     /// glyphs. Wrap your application's asset source with this one to fix that:
@@ -47,7 +47,12 @@ impl IconAssets {
     where
         F: Fn(&str) -> Result<Option<Cow<'static, [u8]>>>,
     {
-        let name = path.strip_prefix(PREFIX).unwrap_or(path);
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let Some(name) = path.strip_prefix(ICON_PREFIX) else {
+            return inner(path);
+        };
         if name.is_empty() {
             return Ok(None);
         }
@@ -66,11 +71,11 @@ impl IconAssets {
         let mut names: Vec<SharedString> = ICON_FILES
             .iter()
             .filter_map(|(file, _)| {
-                let full = format!("{PREFIX}{file}");
+                let full = format!("{ICON_PREFIX}{file}");
                 full.starts_with(path).then(|| full.into())
             })
             .collect();
-        names.extend(inner(path).unwrap_or_default());
+        names.extend(inner(path)?);
         Ok(names)
     }
 }
@@ -86,7 +91,7 @@ impl AssetSource for IconAssets {
 }
 
 pub fn icon_path(name: &str) -> SharedString {
-    format!("{PREFIX}{name}.svg").into()
+    format!("{ICON_PREFIX}{name}.svg").into()
 }
 
 pub fn has_icon(name: &str) -> bool {

@@ -160,7 +160,7 @@ fn asset_source_resolves_every_icon_and_misses_cleanly() {
 
     for name in icon_names() {
         let path = icon_path(name);
-        assert_eq!(path, format!("icons/{name}.svg"));
+        assert_eq!(path, format!("excalidraw/icons/{name}.svg"));
         let bytes = assets
             .load(&path)
             .unwrap_or_else(|e| panic!("loading {path} errored: {e}"))
@@ -171,7 +171,7 @@ fn asset_source_resolves_every_icon_and_misses_cleanly() {
     // A path outside the bundled set falls through to the wrapped asset store,
     // which reports a miss as `Err` rather than `Ok(None)`. Either shape is a
     // clean miss; what must never happen is returning SVG bytes for it.
-    let miss = assets.load("icons/DefinitelyNotAnIcon.svg");
+    let miss = assets.load("excalidraw/icons/DefinitelyNotAnIcon.svg");
     assert!(
         matches!(&miss, Ok(None) | Err(_)),
         "an unknown icon must not resolve to bytes: {miss:?}"
@@ -183,9 +183,11 @@ fn asset_source_resolves_every_icon_and_misses_cleanly() {
             .is_none()
     );
 
-    let listed = assets.list("icons/").expect("list must not error");
+    let listed = assets
+        .list("excalidraw/icons/")
+        .expect("list must not error");
     for name in icon_names() {
-        let expected = format!("icons/{name}.svg");
+        let expected = format!("excalidraw/icons/{name}.svg");
         assert!(
             listed.iter().any(|entry| entry.as_ref() == expected),
             "{expected} is missing from the listed assets"
@@ -224,4 +226,25 @@ fn toolbar_and_chrome_icons_resolve_to_non_trivial_markup() {
             "{name} declares no geometry"
         );
     }
+}
+
+#[test]
+fn namespaced_assets_do_not_capture_host_icons_or_swallow_errors() {
+    use std::borrow::Cow;
+    let fallback = |_: &str| Ok(Some(Cow::Borrowed(&b"host"[..])));
+    for path in ["icons/SelectionIcon.svg", "SelectionIcon.svg", "other/path"] {
+        assert_eq!(
+            IconAssets.load_with(path, fallback).expect("load"),
+            Some(Cow::Borrowed(&b"host"[..]))
+        );
+    }
+    assert!(
+        IconAssets
+            .list_with("icons/", |_| Err(anyhow::anyhow!("host failure")))
+            .is_err()
+    );
+    let listed = IconAssets
+        .list_with("icons/", |_| Ok(vec!["icons/host.svg".into()]))
+        .expect("list");
+    assert_eq!(listed, vec![gpui_kit::SharedString::from("icons/host.svg")]);
 }

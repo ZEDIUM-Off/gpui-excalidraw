@@ -15,7 +15,7 @@ name = "gpui_excalidraw"
 path = "src/lib.rs"
 
 [dependencies]
-gpui-kit = "0.7"
+gpui-kit = { path = "../gpui-kit/crates/kit" }
 perfect_freehand = "0.1.1"
 resvg = "0.45.1"
 tiny-skia = "0.11.4"
@@ -41,4 +41,6 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-gpui-kit = { version = "0.7", features = ["test-support"] }
+gpui-kit = { path = "../gpui-kit/crates/kit", features = ["test-support"] }
+
+[workspace]
